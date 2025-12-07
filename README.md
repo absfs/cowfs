@@ -1,6 +1,9 @@
 # CowFS - Copy on Write FileSystem
 
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/absfs/cowfs/blob/master/LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/absfs/cowfs.svg)](https://pkg.go.dev/github.com/absfs/cowfs)
+[![Go Report Card](https://goreportcard.com/badge/github.com/absfs/cowfs)](https://goreportcard.com/report/github.com/absfs/cowfs)
+[![CI](https://github.com/absfs/cowfs/actions/workflows/ci.yml/badge.svg)](https://github.com/absfs/cowfs/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 The `cowfs` package implements a Copy-on-Write FileSystem that wraps two `absfs.Filer` implementations. It reads from a primary read-only filesystem and directs all writes and modifications to a secondary writable filesystem, leaving the primary unchanged.
 
