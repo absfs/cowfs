@@ -7,6 +7,7 @@ package cowfs
 import (
 	"io"
 	"os"
+	"path"
 	"sync"
 	"time"
 
@@ -76,14 +77,55 @@ func (fs *FileSystem) OpenFile(name string, flag int, perm os.FileMode) (absfs.F
 
 	// For read-only access, check if file has been modified
 	if isModified {
-		return fs.secondary.OpenFile(name, flag, perm)
+		file, err := fs.secondary.OpenFile(name, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		// Check if directory - wrap for merging
+		if info, statErr := file.Stat(); statErr == nil && info.IsDir() {
+			return &mergedDirFile{
+				File:      file,
+				name:      name,
+				fs:        fs,
+				primary:   fs.primary,
+				secondary: fs.secondary,
+			}, nil
+		}
+		return file, nil
 	}
 
 	// Try primary first, fallback to secondary
 	file, err := fs.primary.OpenFile(name, flag, perm)
 	if err != nil {
-		return fs.secondary.OpenFile(name, flag, perm)
+		file, err = fs.secondary.OpenFile(name, flag, perm)
+		if err != nil {
+			return nil, err
+		}
+		// Check if directory from secondary - wrap for merging
+		if info, statErr := file.Stat(); statErr == nil && info.IsDir() {
+			return &mergedDirFile{
+				File:      file,
+				name:      name,
+				fs:        fs,
+				primary:   fs.primary,
+				secondary: fs.secondary,
+			}, nil
+		}
+		return file, nil
 	}
+
+	// Check if this is a directory from primary - wrap for merging
+	info, statErr := file.Stat()
+	if statErr == nil && info.IsDir() {
+		return &mergedDirFile{
+			File:      file,
+			name:      name,
+			fs:        fs,
+			primary:   fs.primary,
+			secondary: fs.secondary,
+		}, nil
+	}
+
 	return file, nil
 }
 
@@ -236,4 +278,165 @@ func (fs *FileSystem) Chown(name string, uid, gid int) error {
 	}
 
 	return fs.secondary.Chown(name, uid, gid)
+}
+
+// Truncate truncates a file to the specified size.
+// If the file exists only in primary, it's copied to secondary first.
+func (fs *FileSystem) Truncate(name string, size int64) error {
+	fs.mu.Lock()
+	wasModified := fs.modified[name]
+	fs.modified[name] = true
+	fs.mu.Unlock()
+
+	// If file wasn't in secondary, copy from primary first
+	if !wasModified {
+		if primaryFile, err := fs.primary.OpenFile(name, os.O_RDONLY, 0); err == nil {
+			stat, _ := primaryFile.Stat()
+			perm := os.FileMode(0644)
+			if stat != nil {
+				perm = stat.Mode().Perm()
+			}
+			secondaryFile, err := fs.secondary.OpenFile(name, os.O_CREATE|os.O_WRONLY, perm)
+			if err == nil {
+				io.Copy(secondaryFile, primaryFile)
+				secondaryFile.Close()
+			}
+			primaryFile.Close()
+		}
+	}
+
+	// Now truncate in secondary
+	f, err := fs.secondary.OpenFile(name, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Truncate(size)
+}
+
+// mergedDirFile wraps a directory File to merge listings from primary and secondary
+// filesystems while filtering deleted entries.
+type mergedDirFile struct {
+	absfs.File
+	name      string
+	fs        *FileSystem
+	primary   absfs.Filer
+	secondary absfs.Filer
+	merged    []os.FileInfo // Cached merged result
+	offset    int           // Current read position in merged
+}
+
+// Readdir reads directory entries, merging from both primary and secondary
+// while filtering deleted files.
+func (f *mergedDirFile) Readdir(n int) ([]os.FileInfo, error) {
+	if f.merged == nil {
+		if err := f.buildMerged(); err != nil {
+			return nil, err
+		}
+	}
+
+	if n <= 0 {
+		// Return all remaining entries
+		result := f.merged[f.offset:]
+		f.offset = len(f.merged)
+		if len(result) == 0 {
+			return result, io.EOF
+		}
+		return result, nil
+	}
+
+	// Return up to n entries
+	if f.offset >= len(f.merged) {
+		return nil, io.EOF
+	}
+
+	end := f.offset + n
+	if end > len(f.merged) {
+		end = len(f.merged)
+	}
+
+	result := f.merged[f.offset:end]
+	f.offset = end
+
+	if f.offset >= len(f.merged) && len(result) < n {
+		return result, io.EOF
+	}
+
+	return result, nil
+}
+
+// Readdirnames reads directory entry names, merging from both filesystems.
+func (f *mergedDirFile) Readdirnames(n int) ([]string, error) {
+	infos, err := f.Readdir(n)
+	names := make([]string, len(infos))
+	for i, info := range infos {
+		names[i] = info.Name()
+	}
+	return names, err
+}
+
+// buildMerged constructs the merged directory listing.
+func (f *mergedDirFile) buildMerged() error {
+	seen := make(map[string]bool)
+	var result []os.FileInfo
+
+	// Get entries from primary
+	primaryFile, err := f.primary.OpenFile(f.name, os.O_RDONLY, 0)
+	if err == nil {
+		primaryEntries, _ := primaryFile.Readdir(-1)
+		primaryFile.Close()
+
+		for _, entry := range primaryEntries {
+			// Skip . and .. entries
+			name := entry.Name()
+			if name == "." || name == ".." {
+				continue
+			}
+
+			// Use path.Join for virtual filesystem paths (always uses /)
+			entryPath := path.Join(f.name, name)
+
+			// Skip if deleted in overlay
+			f.fs.mu.RLock()
+			isDeleted := f.fs.deleted[entryPath]
+			f.fs.mu.RUnlock()
+
+			if !isDeleted {
+				result = append(result, entry)
+				seen[name] = true
+			}
+		}
+	}
+
+	// Get entries from secondary (only new/modified ones not in primary)
+	secondaryFile, err := f.secondary.OpenFile(f.name, os.O_RDONLY, 0)
+	if err == nil {
+		secondaryEntries, _ := secondaryFile.Readdir(-1)
+		secondaryFile.Close()
+
+		for _, entry := range secondaryEntries {
+			// Skip . and .. entries
+			name := entry.Name()
+			if name == "." || name == ".." {
+				continue
+			}
+
+			if !seen[name] {
+				// Use path.Join for virtual filesystem paths (always uses /)
+				entryPath := path.Join(f.name, name)
+
+				// Skip if marked as deleted
+				f.fs.mu.RLock()
+				isDeleted := f.fs.deleted[entryPath]
+				f.fs.mu.RUnlock()
+
+				if !isDeleted {
+					result = append(result, entry)
+				}
+			}
+		}
+	}
+
+	f.merged = result
+	return nil
 }
