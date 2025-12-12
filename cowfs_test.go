@@ -3,6 +3,7 @@ package cowfs
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"sync"
 	"testing"
@@ -95,6 +96,22 @@ func (m *mockFiler) Chown(name string, uid, gid int) error {
 	}
 	return os.ErrNotExist
 }
+func (m *mockFiler) ReadDir(name string) ([]fs.DirEntry, error) {
+	return nil, os.ErrNotExist
+}
+func (m *mockFiler) ReadFile(name string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if f, ok := m.files[name]; ok {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return append([]byte(nil), f.data...), nil
+	}
+	return nil, os.ErrNotExist
+}
+func (m *mockFiler) Sub(dir string) (fs.FS, error) {
+	return absfs.FilerToFS(m, dir)
+}
 
 type mockFile struct {
 	name   string
@@ -137,6 +154,9 @@ func (f *mockFile) WriteAt(b []byte, off int64) (int, error) {
 }
 func (f *mockFile) WriteString(s string) (int, error) { return len(s), nil }
 func (f *mockFile) Truncate(size int64) error         { return nil }
+func (f *mockFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	return nil, nil
+}
 
 type mockFileInfo struct {
 	name string

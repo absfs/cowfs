@@ -6,6 +6,7 @@ package cowfs
 
 import (
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"sync"
@@ -314,6 +315,111 @@ func (fs *FileSystem) Truncate(name string, size int64) error {
 	return f.Truncate(size)
 }
 
+// ReadDir reads the named directory and returns a list of directory entries.
+func (cfs *FileSystem) ReadDir(name string) ([]fs.DirEntry, error) {
+	cfs.mu.RLock()
+	isDeleted := cfs.deleted[name]
+	isModified := cfs.modified[name]
+	cfs.mu.RUnlock()
+
+	if isDeleted {
+		return nil, os.ErrNotExist
+	}
+
+	// If the directory was modified, read from secondary
+	if isModified {
+		return cfs.secondary.ReadDir(name)
+	}
+
+	// Try primary first
+	entries, err := cfs.primary.ReadDir(name)
+	if err != nil {
+		// Fallback to secondary
+		return cfs.secondary.ReadDir(name)
+	}
+
+	// Filter deleted entries and merge with secondary
+	var result []fs.DirEntry
+	seen := make(map[string]bool)
+
+	for _, entry := range entries {
+		entryPath := path.Join(name, entry.Name())
+		cfs.mu.RLock()
+		isDeleted := cfs.deleted[entryPath]
+		cfs.mu.RUnlock()
+
+		if !isDeleted {
+			result = append(result, entry)
+			seen[entry.Name()] = true
+		}
+	}
+
+	// Add entries from secondary that aren't in primary
+	secondaryEntries, err := cfs.secondary.ReadDir(name)
+	if err == nil {
+		for _, entry := range secondaryEntries {
+			if !seen[entry.Name()] {
+				entryPath := path.Join(name, entry.Name())
+				cfs.mu.RLock()
+				isDeleted := cfs.deleted[entryPath]
+				cfs.mu.RUnlock()
+
+				if !isDeleted {
+					result = append(result, entry)
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// ReadFile reads the named file and returns its contents.
+func (cfs *FileSystem) ReadFile(name string) ([]byte, error) {
+	cfs.mu.RLock()
+	isDeleted := cfs.deleted[name]
+	isModified := cfs.modified[name]
+	cfs.mu.RUnlock()
+
+	if isDeleted {
+		return nil, os.ErrNotExist
+	}
+
+	// If the file was modified, read from secondary
+	if isModified {
+		return cfs.secondary.ReadFile(name)
+	}
+
+	// Try primary first
+	data, err := cfs.primary.ReadFile(name)
+	if err != nil {
+		// Fallback to secondary
+		return cfs.secondary.ReadFile(name)
+	}
+
+	return data, nil
+}
+
+// TempDir returns the temp directory path from the secondary (writable) filesystem.
+// This implements the optional temper interface so that ExtendFiler can delegate
+// to the appropriate filesystem.
+func (cfs *FileSystem) TempDir() string {
+	// Check if secondary implements temper
+	type temper interface {
+		TempDir() string
+	}
+	if t, ok := cfs.secondary.(temper); ok {
+		return t.TempDir()
+	}
+	// Fallback to /tmp
+	return "/tmp"
+}
+
+// Sub returns a Filer corresponding to the subtree rooted at dir.
+func (cfs *FileSystem) Sub(dir string) (fs.FS, error) {
+	return absfs.FilerToFS(cfs, dir)
+}
+
 // mergedDirFile wraps a directory File to merge listings from primary and secondary
 // filesystems while filtering deleted entries.
 type mergedDirFile struct {
@@ -373,6 +479,13 @@ func (f *mergedDirFile) Readdirnames(n int) ([]string, error) {
 		names[i] = info.Name()
 	}
 	return names, err
+}
+
+// ReadDir reads directory entries, merging from both primary and secondary
+// while filtering deleted files. Returns fs.DirEntry values.
+func (f *mergedDirFile) ReadDir(n int) ([]fs.DirEntry, error) {
+	// Use the filesystem-level ReadDir for proper merging
+	return f.fs.ReadDir(f.name)
 }
 
 // buildMerged constructs the merged directory listing.
@@ -439,4 +552,59 @@ func (f *mergedDirFile) buildMerged() error {
 
 	f.merged = result
 	return nil
+}
+
+// emptyFiler is a minimal Filer that always returns ErrNotExist.
+// It's used as a placeholder when a sub-filesystem doesn't have a corresponding directory.
+type emptyFiler struct{}
+
+func (e *emptyFiler) OpenFile(name string, flag int, perm os.FileMode) (absfs.File, error) {
+	return nil, os.ErrNotExist
+}
+
+func (e *emptyFiler) Mkdir(name string, perm os.FileMode) error {
+	return os.ErrNotExist
+}
+
+func (e *emptyFiler) Remove(name string) error {
+	return os.ErrNotExist
+}
+
+func (e *emptyFiler) Rename(oldpath, newpath string) error {
+	return os.ErrNotExist
+}
+
+func (e *emptyFiler) Stat(name string) (os.FileInfo, error) {
+	return nil, os.ErrNotExist
+}
+
+func (e *emptyFiler) Chmod(name string, mode os.FileMode) error {
+	return os.ErrNotExist
+}
+
+func (e *emptyFiler) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	return os.ErrNotExist
+}
+
+func (e *emptyFiler) Chown(name string, uid, gid int) error {
+	return os.ErrNotExist
+}
+
+func (e *emptyFiler) ReadDir(name string) ([]fs.DirEntry, error) {
+	return nil, os.ErrNotExist
+}
+
+func (e *emptyFiler) ReadFile(name string) ([]byte, error) {
+	return nil, os.ErrNotExist
+}
+
+func (e *emptyFiler) Sub(dir string) (fs.FS, error) {
+	return &emptyFS{}, nil
+}
+
+// emptyFS is a minimal fs.FS that always returns ErrNotExist.
+type emptyFS struct{}
+
+func (e *emptyFS) Open(name string) (fs.File, error) {
+	return nil, fs.ErrNotExist
 }
